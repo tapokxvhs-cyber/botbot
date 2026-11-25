@@ -86,6 +86,17 @@ log = logging.getLogger("paid-gifts")
 if not 1 <= SUBSCRIPTION_STARS <= 10_000:
     raise ValueError("SUBSCRIPTION_STARS должен быть от 1 до 10000")
 
+# Настройки, которые владелец меняет командой /set без перезапуска.
+# ключ: (описание, минимум, максимум, значение по умолчанию)
+SETTINGS: dict[str, tuple[str, int, int, int]] = {
+    "stars": ("цена подписки, Stars (для новых счетов)", 1, 10_000, SUBSCRIPTION_STARS),
+    "trial_hours": ("длина пробного периода, часов", 1, 720, 24),
+    "probe_interval": ("интервал опроса коллекций, секунд", 5, 3600, PROBE_INTERVAL),
+    "notify_max_age": ("не рассылать апгрейды старше N секунд (защита от потока после перезапуска)", 0, 86_400, 600),
+}
+# Первый проход опроса после запуска идёт «тихо»: только запоминаем, без рассылки.
+_probe_warm: set[str] = set()
+
 
 def db_connect() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH)
@@ -136,6 +147,10 @@ def init_db() -> None:
         )
 
         con.execute(
+            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value INTEGER NOT NULL)"
+        )
+
+        con.execute(
             """
             CREATE TABLE IF NOT EXISTS gift_probe (
                 prefix TEXT PRIMARY KEY,
@@ -156,6 +171,25 @@ def init_db() -> None:
                 created_at INTEGER NOT NULL
             )
             """
+        )
+
+
+def get_setting(key: str) -> int:
+    default = SETTINGS[key][3]
+    try:
+        with db_connect() as con:
+            row = con.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return int(row["value"]) if row else default
+    except sqlite3.Error:
+        return default
+
+
+def set_setting(key: str, value: int) -> None:
+    with db_connect() as con:
+        con.execute(
+            "INSERT INTO settings(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
         )
 
 
@@ -196,7 +230,7 @@ def save_subscription(user_id: int, expires_at: int, charge_id: str) -> None:
 
 def start_trial(user_id: int) -> bool:
     now = int(time.time())
-    expires_at = now + 24 * 60 * 60
+    expires_at = now + get_setting("trial_hours") * 60 * 60
 
     with db_connect() as con:
         cursor = con.execute(
@@ -437,11 +471,11 @@ def register_paid_gifts(dp: Dispatcher, bot: Bot) -> None:
 
         if start_trial(user_id):
             expires = datetime.fromtimestamp(
-                now + 24 * 60 * 60
+                now + get_setting("trial_hours") * 60 * 60
             ).strftime("%d.%m.%Y %H:%M")
 
             await message.answer(
-                "🎁 Ты получил бесплатный пробный доступ на 24 часа!\n\n"
+                f"🎁 Ты получил бесплатный пробный доступ на {get_setting('trial_hours')} ч.!\n\n"
                 f"Доступ действует до {expires}.\n"
                 "После окончания можно оформить подписку за Stars."
             )
@@ -457,7 +491,7 @@ def register_paid_gifts(dp: Dispatcher, bot: Bot) -> None:
                 prices=[
                     LabeledPrice(
                         label="Доступ на 30 дней",
-                        amount=SUBSCRIPTION_STARS,
+                        amount=get_setting("stars"),
                     )
                 ],
                 subscription_period=SUBSCRIPTION_PERIOD,
@@ -467,7 +501,7 @@ def register_paid_gifts(dp: Dispatcher, bot: Bot) -> None:
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text=f"⭐ Купить за {SUBSCRIPTION_STARS} Stars",
+                            text=f"⭐ Купить за {get_setting('stars')} Stars",
                             url=invoice_link,
                         )
                     ]
@@ -476,7 +510,7 @@ def register_paid_gifts(dp: Dispatcher, bot: Bot) -> None:
 
             await message.answer(
                 "🎁 Бесплатный пробный период уже использован.\n\n"
-                f"Подписка на 30 дней: {SUBSCRIPTION_STARS} Stars.",
+                f"Подписка на 30 дней: {get_setting('stars')} Stars.",
                 reply_markup=keyboard,
             )
 
@@ -488,7 +522,7 @@ def register_paid_gifts(dp: Dispatcher, bot: Bot) -> None:
 
     @dp.pre_checkout_query(F.invoice_payload == INVOICE_PAYLOAD)
     async def process_pre_checkout(query: PreCheckoutQuery) -> None:
-        if query.currency != "XTR" or query.total_amount != SUBSCRIPTION_STARS:
+        if query.currency != "XTR" or query.total_amount != get_setting("stars"):
             await query.answer(
                 ok=False,
                 error_message="Не удалось проверить стоимость подписки. Попробуй открыть счёт заново.",
@@ -527,7 +561,7 @@ def register_paid_gifts(dp: Dispatcher, bot: Bot) -> None:
         if not has_access(message.from_user.id):
             await message.answer(
                 "🔒 Список доступен по подписке.\n"
-                f"Стоимость: {SUBSCRIPTION_STARS} Stars за 30 дней.\n"
+                f"Стоимость: {get_setting('stars')} Stars за 30 дней.\n"
                 "Оформить: /subscribe"
             )
             return
@@ -641,6 +675,36 @@ def register_paid_gifts(dp: Dispatcher, bot: Bot) -> None:
         text = "\n".join(lines)
         for i in range(0, len(text), 4000):  # лимит Telegram 4096 символов
             await message.answer(text[i:i + 4000])
+
+    @dp.message(Command("settings"))
+    async def settings_command(message: Message) -> None:
+        if not is_owner(message.from_user.id):
+            return
+        lines = ["⚙️ <b>Настройки</b> (менять: /set имя значение)\n"]
+        for key, (desc, lo, hi, default) in SETTINGS.items():
+            lines.append(f"<code>{key}</code> = <b>{get_setting(key)}</b> — {desc} [{lo}–{hi}, по умолчанию {default}]")
+        await message.answer("\n".join(lines))
+
+    @dp.message(Command("set"))
+    async def set_command(message: Message) -> None:
+        if not is_owner(message.from_user.id):
+            return
+        parts = (message.text or "").split()
+        if len(parts) != 3 or parts[1] not in SETTINGS:
+            await message.answer("Формат: /set имя значение\nСписок: /settings")
+            return
+        key = parts[1]
+        _, lo, hi, _ = SETTINGS[key]
+        try:
+            value = int(parts[2])
+        except ValueError:
+            await message.answer("Значение должно быть целым числом.")
+            return
+        if not lo <= value <= hi:
+            await message.answer(f"Допустимо от {lo} до {hi}.")
+            return
+        set_setting(key, value)
+        await message.answer(f"✅ {key} = <b>{value}</b>. Применено сразу, перезапуск не нужен.")
 
     @dp.message(Command("cancel_sub"))
     async def cancel_subscription(message: Message) -> None:
@@ -792,7 +856,7 @@ def classify_gift_action(action: Any) -> tuple[str, str]:
     return "skip", "уникальный подарок без флага upgrade (флаги: " + (", ".join(flags) or "нет") + ")"
 
 
-async def store_and_notify(bot: Bot, gift: Any, date: Any, source: str) -> bool:
+async def store_and_notify(bot: Bot, gift: Any, date: Any, source: str, notify: bool = True) -> bool:
     """Сохранить подарок и разослать активным подписчикам. True — подарок новый."""
     if gift is None:
         log.warning("[%s] пропуск: объект подарка пустой", source)
@@ -805,6 +869,13 @@ async def store_and_notify(bot: Bot, gift: Any, date: Any, source: str) -> bool:
     if not is_new:
         log.info("[%s] пропуск: %s #%s уже есть в базе", source, data.get("title"), data.get("number"))
         return False
+
+    max_age = get_setting("notify_max_age")
+    age = int(time.time()) - int(data.get("created_at") or 0)
+    if not notify or (max_age and age > max_age):
+        log.info("[%s] сохранён без рассылки (старый/тихий режим, возраст %d c): %s #%s",
+                 source, age, data.get("title"), data.get("number"))
+        return True
 
     subscribers = get_active_subscribers()
     log.info(
@@ -923,6 +994,7 @@ async def probe_step(bot: Bot, client: Any, prefix: str, warned: set[str] | None
             return
         _set_probe(prefix, last)
         log.info("[probe] %s: стартовый номер %s (старые не рассылаются)", prefix, last)
+        _probe_warm.add(prefix)
 
     # Последовательно проверяем новые номера и КАЖДЫЙ найденный сразу сохраняем и рассылаем
     for _ in range(9999999999):
@@ -937,16 +1009,18 @@ async def probe_step(bot: Bot, client: Any, prefix: str, warned: set[str] | None
             break
 
         # Сохраняем и рассылаем подписчикам
-        await store_and_notify(bot, gift, None, f"probe:{prefix}")
+        await store_and_notify(bot, gift, None, f"probe:{prefix}", notify=prefix in _probe_warm)
 
         last = next_num
         _set_probe(prefix, last)
         log.info("[probe] найден и обработан %s", slug)
 
+    _probe_warm.add(prefix)  # дальше — обычный режим с рассылкой
+
 
 async def gift_probe_loop(bot: Bot, client: Any, prefix: str) -> None:
     """Следить за одной коллекцией (GIFT_PROBE_SLUGS=PlushPepe)."""
-    log.info("[probe] слежу за коллекцией %r каждые %s c", prefix, PROBE_INTERVAL)
+    log.info("[probe] слежу за коллекцией %r каждые %s c", prefix, get_setting("probe_interval"))
     warned: set[str] = set()
     while client.is_connected():
         try:
@@ -955,7 +1029,7 @@ async def gift_probe_loop(bot: Bot, client: Any, prefix: str) -> None:
             raise
         except Exception:
             log.exception("[probe] ошибка при опросе %s", prefix)
-        await asyncio.sleep(PROBE_INTERVAL)
+        await asyncio.sleep(get_setting("probe_interval"))
 
 
 async def _list_upgradable_prefixes(client: Any) -> list[str]:
