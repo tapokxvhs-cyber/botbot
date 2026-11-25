@@ -837,7 +837,7 @@ async def probe_step(bot: Bot, client: Any, prefix: str, warned: set[str] | None
         log.info("[probe] %s: стартовый номер %s (старые не рассылаются)", prefix, last)
 
     # Последовательно проверяем новые номера и КАЖДЫЙ найденный сразу сохраняем и рассылаем
-    for _ in range(10):
+    for _ in range(9999999999):
         next_num = last + 1
         slug = f"{prefix}-{next_num}"
 
