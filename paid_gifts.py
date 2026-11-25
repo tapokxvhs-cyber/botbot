@@ -116,6 +116,25 @@ def init_db() -> None:
             """
         )
 
+        # Все, кто хоть раз написал /start
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS start_users (
+                user_id INTEGER PRIMARY KEY,
+                first_seen INTEGER NOT NULL
+            )
+            """
+        )
+        # Те, кто уже есть в подписках/пробных, точно запускали бота — добавим их
+        con.execute(
+            "INSERT OR IGNORE INTO start_users(user_id, first_seen) "
+            "SELECT user_id, used_at FROM trial_users"
+        )
+        con.execute(
+            "INSERT OR IGNORE INTO start_users(user_id, first_seen) "
+            "SELECT user_id, CAST(strftime('%s','now') AS INTEGER) FROM subscriptions"
+        )
+
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS gift_probe (
@@ -293,6 +312,14 @@ def get_active_subscribers() -> list[int]:
     return ids
 
 
+def register_start_user(user_id: int) -> None:
+    with db_connect() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO start_users(user_id, first_seen) VALUES (?, ?)",
+            (user_id, int(time.time())),
+        )
+
+
 def get_subscription_stats() -> dict[str, int]:
     """Сводка по подпискам: активные платные, активные пробные, истёкшие, всего."""
     now = int(time.time())
@@ -314,8 +341,10 @@ def get_subscription_stats() -> dict[str, int]:
         ).fetchone()[0]
         trial_used = con.execute("SELECT COUNT(*) FROM trial_users").fetchone()[0]
         gifts_count = con.execute("SELECT COUNT(*) FROM gifts").fetchone()[0]
+        started = con.execute("SELECT COUNT(*) FROM start_users").fetchone()[0]
 
     return {
+        "started": int(started),
         "total": int(total),
         "active": int(active),
         "active_paid": int(active_paid),
@@ -357,6 +386,19 @@ def register_paid_gifts(dp: Dispatcher, bot: Bot) -> None:
         startup_stats["active_paid"], startup_stats["active_trial"], startup_stats["expired"],
         startup_stats["trial_used"], startup_stats["gifts"],
     )
+
+    # Считаем всех, кто написал /start (middleware срабатывает до любых хендлеров,
+    # поэтому работает и с твоим существующим обработчиком /start).
+    async def count_start_middleware(handler, event, data):
+        try:
+            text = (event.text or "").strip()
+            if event.from_user and (text == "/start" or text.startswith(("/start ", "/start@"))):
+                register_start_user(event.from_user.id)
+        except Exception:
+            log.exception("Не удалось записать /start")
+        return await handler(event, data)
+
+    dp.message.outer_middleware(count_start_middleware)
 
     @dp.message(Command("subscribe"))
     async def subscribe_command(message: Message) -> None:
@@ -515,8 +557,9 @@ def register_paid_gifts(dp: Dispatcher, bot: Bot) -> None:
             await message.answer(
                 "👑 Доступ владельца: бессрочный.\n\n"
                 "📊 <b>Статистика подписок</b>\n"
-                f"• Активных платных: <b>{stats['active_paid']}</b>\n"
-                f"• Активных пробных: <b>{stats['active_trial']}</b>\n"
+                f"• Нажали /start: <b>{stats['started']}</b>\n"
+                f"• Бесплатных (пробный активен): <b>{stats['active_trial']}</b>\n"
+                f"• Платных (активных): <b>{stats['active_paid']}</b>\n"
                 f"• Истёкших: {stats['expired']}\n"
                 f"• Всего записей о подписках: {stats['total']}\n"
                 f"• Пробных периодов активировано за всё время: {stats['trial_used']}\n\n"
@@ -542,8 +585,9 @@ def register_paid_gifts(dp: Dispatcher, bot: Bot) -> None:
         text = (
             "📊 <b>Сводка по боту</b>\n\n"
             "<b>Подписки</b>\n"
-            f"• Активных платных: <b>{stats['active_paid']}</b>\n"
-            f"• Активных пробных: <b>{stats['active_trial']}</b>\n"
+            f"• Нажали /start: <b>{stats['started']}</b>\n"
+            f"• Бесплатных (пробный активен): <b>{stats['active_trial']}</b>\n"
+            f"• Платных (активных): <b>{stats['active_paid']}</b>\n"
             f"• Истёкших: {stats['expired']}\n"
             f"• Всего записей: {stats['total']}\n"
             f"• Пробных активировано всего: {stats['trial_used']}\n\n"
@@ -553,6 +597,50 @@ def register_paid_gifts(dp: Dispatcher, bot: Bot) -> None:
         if OWNER_ID:
             text += f"\n👑 Владелец: {OWNER_ID} (бессрочный доступ)"
         await message.answer(text)
+
+    @dp.message(Command("subscribers", "подписчики"))
+    async def subscribers_command(message: Message) -> None:
+        if not is_owner(message.from_user.id):
+            return  # для остальных команда молчит
+
+        stats = get_subscription_stats()
+        now = int(time.time())
+        with db_connect() as con:
+            paid = con.execute(
+                "SELECT user_id, expires_at, auto_renew FROM subscriptions "
+                "WHERE expires_at > ? AND charge_id != 'trial' ORDER BY expires_at",
+                (now,),
+            ).fetchall()
+            trial = con.execute(
+                "SELECT user_id, expires_at FROM subscriptions "
+                "WHERE expires_at > ? AND charge_id = 'trial' ORDER BY expires_at",
+                (now,),
+            ).fetchall()
+
+        def fmt(ts: int) -> str:
+            return datetime.fromtimestamp(int(ts)).strftime("%d.%m.%Y %H:%M")
+
+        lines = [
+            "👥 <b>Подписчики</b>\n",
+            f"• Нажали /start: <b>{stats['started']}</b>",
+            f"• Бесплатных (пробный активен): <b>{stats['active_trial']}</b>",
+            f"• Платных (активных): <b>{stats['active_paid']}</b>",
+            f"• Пробных взято за всё время: {stats['trial_used']}",
+            f"• Истёкших: {stats['expired']}",
+        ]
+        if paid:
+            lines.append("\n⭐ <b>Платные:</b>")
+            for r in paid:
+                renew = "авто" if int(r["auto_renew"]) else "без авто"
+                lines.append(f"<code>{r['user_id']}</code> — до {fmt(r['expires_at'])} ({renew})")
+        if trial:
+            lines.append("\n🎁 <b>Бесплатные (пробный):</b>")
+            for r in trial:
+                lines.append(f"<code>{r['user_id']}</code> — до {fmt(r['expires_at'])}")
+
+        text = "\n".join(lines)
+        for i in range(0, len(text), 4000):  # лимит Telegram 4096 символов
+            await message.answer(text[i:i + 4000])
 
     @dp.message(Command("cancel_sub"))
     async def cancel_subscription(message: Message) -> None:
