@@ -1032,22 +1032,29 @@ async def gift_probe_loop(bot: Bot, client: Any, prefix: str) -> None:
         await asyncio.sleep(get_setting("probe_interval"))
 
 
-async def _list_upgradable_prefixes(client: Any) -> list[str]:
-    """Каталог подарков (payments.getStarGifts) -> префиксы слагов тех, что можно апгрейдить."""
+async def _list_upgradable_prefixes(client: Any) -> list[tuple[str, str]]:
+    """Каталог подарков (payments.getStarGifts) -> (название, префикс слага) для апгрейдимых.
+
+    Префикс берём из поля slug самого подарка — это точный префикс уникальных
+    экземпляров (Slug-1, Slug-2, ...). Старое поведение (вывод из названия)
+    оставлено как запасной вариант: оно ломается на кириллице, цифрах,
+    эмодзи и неочевидных сокращениях в названии.
+    """
     from telethon.tl import functions
 
     res = await client(functions.payments.GetStarGiftsRequest(hash=0))
-    prefixes: list[str] = []
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
     for g in (getattr(res, "gifts", None) or []):
         if not getattr(g, "upgrade_stars", None):
             continue
-        title = getattr(g, "title", None)
-        if not title:
-            continue
-        prefix = re.sub(r"[^0-9A-Za-z]", "", str(title))
-        if prefix and prefix not in prefixes:
-            prefixes.append(prefix)
-    return prefixes
+        title = str(getattr(g, "title", "") or "").strip() or "(без названия)"
+        slug = str(getattr(g, "slug", "") or "").strip()
+        prefix = slug or re.sub(r"[^0-9A-Za-z]", "", title)
+        if prefix and prefix not in seen:
+            seen.add(prefix)
+            found.append((title, prefix))
+    return found
 
 
 async def probe_all_loop(bot: Bot, client: Any) -> None:
@@ -1058,9 +1065,14 @@ async def probe_all_loop(bot: Bot, client: Any) -> None:
     while client.is_connected():
         if not prefixes or time.time() - refreshed > 3600:
             try:
-                prefixes = await _list_upgradable_prefixes(client)
+                found = await _list_upgradable_prefixes(client)
+                prefixes = [prefix for _, prefix in found]
                 refreshed = time.time()
-                log.info("[probe-all] коллекций в наблюдении: %d: %s", len(prefixes), ", ".join(prefixes))
+                log.info(
+                    "[probe-all] коллекций в наблюдении: %d: %s",
+                    len(prefixes),
+                    ", ".join(f"{title}→{prefix}" for title, prefix in found),
+                )
                 if not prefixes:
                     log.warning("[probe-all] каталог пуст или без апгрейдимых подарков")
             except asyncio.CancelledError:
